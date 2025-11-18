@@ -1,5 +1,7 @@
 import os
-from typing import List, Optional, Set, Dict, Any
+import re
+from datetime import datetime
+from typing import List, Optional, Set, Dict, Any, Tuple
 from urllib.parse import urlparse, urljoin
 
 import requests
@@ -9,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import db, create_document
+from schemas import ConversionRecord
 
 app = FastAPI()
 
@@ -80,9 +83,120 @@ def fetch_page(url: str) -> Dict[str, Any]:
         soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else None
         tables = extract_tables(html)
-        return {"url": url, "title": title, "tables": tables}
+        return {"url": url, "title": title, "html": html, "tables": tables}
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Network error: {str(e)}")
+
+
+# Lightweight OCR surrogate: use image alt/title/aria-label and nearby captions
+
+def collect_text_candidates(soup: BeautifulSoup, ocr: bool = False) -> List[str]:
+    lines: List[str] = []
+    # Headings and paragraphs
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "span", "div"]):
+        txt = tag.get_text(" ", strip=True)
+        if txt and len(txt) >= 2:
+            lines.append(txt)
+    # Optional: image metadata
+    if ocr:
+        for img in soup.find_all("img"):
+            for attr in ("alt", "title", "aria-label"):
+                val = img.get(attr)
+                if val and len(val.strip()) > 2:
+                    lines.append(val.strip())
+            # look for sibling caption-like text
+            parent = img.parent
+            for sib in (parent.find_next_siblings() if parent else []):
+                st = sib.get_text(" ", strip=True)
+                if st:
+                    lines.append(st)
+                    break
+    # Deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for l in lines:
+        if l not in seen:
+            uniq.append(l)
+            seen.add(l)
+    return uniq
+
+
+def parse_rate_from_match(m: re.Match) -> Tuple[str, str, float]:
+    # Normalize commas to dots and cast
+    def num(x: str) -> float:
+        return float(x.replace(",", "."))
+
+    if m.lastgroup == "eq":
+        a1 = num(m.group("a1"))
+        s = m.group("s").strip()
+        a2 = num(m.group("a2"))
+        t = m.group("t").strip()
+        if a1 == 0:
+            raise ValueError("zero source amount")
+        rate = a2 / a1
+        return s, t, rate
+    elif m.lastgroup == "one":
+        s = m.group("s").strip()
+        a2 = num(m.group("a2"))
+        t = m.group("t").strip()
+        return s, t, a2
+    elif m.lastgroup == "ratio":
+        s = m.group("s").strip()
+        t = m.group("t").strip()
+        a1 = num(m.group("a1"))
+        a2 = num(m.group("a2"))
+        if a1 == 0:
+            raise ValueError("zero source amount")
+        rate = a2 / a1
+        return s, t, rate
+    else:
+        raise ValueError("unknown pattern")
+
+
+def extract_conversions(url: str, title: Optional[str], html: str, ocr: bool = False) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    lines = collect_text_candidates(soup, ocr=ocr)
+
+    # Regex patterns for common styles
+    # 1) "1 Gem = 100 Coins" or "2 Gems = 300 Coins"
+    p_eq = re.compile(r"(?P<a1>\d+(?:[.,]\d+)?)\s*(?:x|×)?\s*(?P<s>[A-Za-z][A-Za-z \-]*)\s*(?:=|=>|→|to)\s*(?P<a2>\d+(?:[.,]\d+)?)\s*(?P<t>[A-Za-z][A-Za-z \-]*)", re.IGNORECASE)
+    # 2) "1 Gem to 100 Coin" handled by eq
+    # 3) Ratio style: "Gem to Coin: 1:100" or "Gem→Coin 1:100"
+    p_ratio = re.compile(r"(?P<s>[A-Za-z][A-Za-z \-]*)\s*(?:to|→|->|:)\n\s*(?P<t>[A-Za-z][A-Za-z \-]*)\s*[:\- ]\s*(?P<a1>\d+(?:[.,]\d+)?)\s*[:/]\s*(?P<a2>\d+(?:[.,]\d+)?)", re.IGNORECASE)
+    # 4) "1 Gem = 100" with inferred target from nearby context is hard; skip.
+
+    results: List[Dict[str, Any]] = []
+    for line in lines:
+        # try equal pattern
+        m = p_eq.search(line)
+        if m:
+            try:
+                s, t, rate = parse_rate_from_match(m)
+                results.append({"source": s.strip(), "target": t.strip(), "rate": float(rate), "text": line, "page_url": url, "page_title": title})
+                continue
+            except Exception:
+                pass
+        # try ratio pattern
+        m2 = p_ratio.search(line)
+        if m2:
+            try:
+                s, t, rate = parse_rate_from_match(m2)
+                results.append({"source": s.strip(), "target": t.strip(), "rate": float(rate), "text": line, "page_url": url, "page_title": title})
+                continue
+            except Exception:
+                pass
+
+    # Post-process: normalize multi-spaces
+    for r in results:
+        r["source"] = re.sub(r"\s+", " ", r["source"]).strip().title()
+        r["target"] = re.sub(r"\s+", " ", r["target"]).strip().title()
+    # Deduplicate by (page_url, source, target, rate)
+    uniq: Dict[Tuple[str, str, str, float], Dict[str, Any]] = {}
+    for r in results:
+        key = (r["page_url"], r["source"], r["target"], r["rate"])
+        if key not in uniq:
+            uniq[key] = r
+    return list(uniq.values())
 
 
 # -----------------------------
@@ -100,16 +214,19 @@ class ScrapeRequest(BaseModel):
 # -----------------------------
 
 @app.get("/")
+
 def read_root():
     return {"message": "Ball TD conversions API is running"}
 
 
 @app.get("/api/hello")
+
 def hello():
     return {"message": "Hello from the backend API!"}
 
 
 @app.get("/test")
+
 def test_database():
     response = {
         "backend": "✅ Running",
@@ -145,6 +262,7 @@ def test_database():
 
 
 @app.post("/api/scrape")
+
 def scrape(req: ScrapeRequest):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -193,23 +311,32 @@ def scrape(req: ScrapeRequest):
 
 
 @app.get("/api/pages")
+
 def list_pages(limit: int = Query(100, ge=1, le=1000)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
     docs = db["scrapepage"].find({}, {"tables": {"$slice": 0}}).limit(limit)
     results = []
     for d in docs:
+        url = d.get("url")
+        conv_count = 0
+        try:
+            conv_count = db["conversion"].count_documents({"page_url": url})
+        except Exception:
+            conv_count = 0
         results.append({
             "id": str(d.get("_id")),
-            "url": d.get("url"),
+            "url": url,
             "path": d.get("path"),
             "title": d.get("title"),
-            "table_count": len(d.get("tables", []))
+            "table_count": len(d.get("tables", [])),
+            "conversion_count": conv_count,
         })
     return {"items": results}
 
 
 @app.get("/api/page")
+
 def get_page(url: Optional[str] = None, id: Optional[str] = None):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not available")
@@ -233,6 +360,114 @@ def get_page(url: Optional[str] = None, id: Optional[str] = None):
     # Convert ObjectId
     doc["id"] = str(doc.pop("_id", ""))
     return doc
+
+
+# -------- Conversion endpoints --------
+
+@app.post("/api/extract")
+
+def extract_conversions_endpoint(payload: Dict[str, Any]):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    url = payload.get("url")
+    pid = payload.get("id")
+    ocr = bool(payload.get("ocr", False))
+    if not url and not pid:
+        raise HTTPException(status_code=400, detail="Provide url or id")
+
+    # Fetch page record and html
+    page_doc = None
+    if url:
+        page_doc = db["scrapepage"].find_one({"url": clean_url(url)})
+    else:
+        from bson import ObjectId
+        try:
+            page_doc = db["scrapepage"].find_one({"_id": ObjectId(pid)})
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid id")
+
+    html = None
+    page_url = None
+    page_title = None
+    if page_doc:
+        page_url = page_doc.get("url")
+        page_title = page_doc.get("title")
+        # We don't store HTML; fetch it live
+        try:
+            fetched = fetch_page(page_url)
+            html = fetched.get("html")
+            page_title = page_title or fetched.get("title")
+        except HTTPException as e:
+            raise e
+    else:
+        # If not in DB, fetch directly
+        if not url:
+            raise HTTPException(status_code=404, detail="Page not found")
+        fetched = fetch_page(url)
+        page_url = fetched["url"]
+        page_title = fetched.get("title")
+        html = fetched.get("html")
+
+    items = extract_conversions(page_url, page_title, html, ocr=ocr)
+
+    # Upsert into collection
+    upserts = 0
+    for it in items:
+        now = datetime.utcnow()
+        q = {"page_url": it["page_url"], "source": it["source"], "target": it["target"]}
+        update = {"$set": {"rate": it["rate"], "text": it.get("text"), "page_title": it.get("page_title"), "updated_at": now},
+                  "$setOnInsert": {"created_at": now}}
+        db["conversion"].update_one(q, update, upsert=True)
+        upserts += 1
+
+    return {"status": "ok", "count": len(items), "upserts": upserts, "items": items}
+
+
+@app.get("/api/conversions")
+
+def list_conversions(page_url: Optional[str] = None, limit: int = Query(200, ge=1, le=1000)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    query: Dict[str, Any] = {}
+    if page_url:
+        query["page_url"] = clean_url(page_url)
+    cur = db["conversion"].find(query).limit(limit)
+    items: List[Dict[str, Any]] = []
+    for d in cur:
+        d["id"] = str(d.pop("_id", ""))
+        items.append(d)
+    return {"items": items}
+
+
+@app.post("/api/conversions/upsert")
+
+def upsert_conversions(payload: Dict[str, Any]):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not available")
+    page_url = payload.get("page_url")
+    page_title = payload.get("page_title")
+    items = payload.get("items", [])
+    if not page_url:
+        raise HTTPException(status_code=400, detail="page_url is required")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items must be a non-empty list")
+
+    upserts = 0
+    for it in items:
+        try:
+            source = str(it["source"]).strip()
+            target = str(it["target"]).strip()
+            rate = float(it["rate"])
+        except Exception:
+            continue
+        now = datetime.utcnow()
+        q = {"page_url": clean_url(page_url), "source": source, "target": target}
+        update = {"$set": {"rate": rate, "text": it.get("text"), "page_title": page_title or it.get("page_title"), "updated_at": now},
+                  "$setOnInsert": {"created_at": now}}
+        db["conversion"].update_one(q, update, upsert=True)
+        upserts += 1
+
+    return {"status": "ok", "upserts": upserts}
 
 
 if __name__ == "__main__":

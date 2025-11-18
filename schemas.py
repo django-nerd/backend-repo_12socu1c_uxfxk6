@@ -55,4 +55,29 @@ class ScrapePage(BaseModel):
     scraped_at: Optional[datetime] = None
     extra: Optional[Dict[str, Any]] = None
 
-# Add your own schemas here if needed
+# Conversions
+class ConversionRecord(BaseModel):
+    """
+    Normalized currency/resource conversion rate extracted from pages.
+    Collection name: "conversion"
+    """
+    page_url: str
+    page_title: Optional[str] = None
+    source: str = Field(..., description="Source currency/resource name, e.g., Gem")
+    target: str = Field(..., description="Target currency/resource name, e.g., Coin")
+    rate: float = Field(..., gt=0, description="How many target units per 1 source unit")
+    text: Optional[str] = Field(None, description="Original text snippet the rate was parsed from")
+    context: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class ConversionsUpsert(BaseModel):
+    page_url: str
+    page_title: Optional[str] = None
+    items: List[ConversionRecord]
+
+class ExtractRequest(BaseModel):
+    url: Optional[str] = None
+    id: Optional[str] = None
+    ocr: bool = False
+    """If true, attempt to parse information from image metadata/alt text as a lightweight OCR surrogate."""
