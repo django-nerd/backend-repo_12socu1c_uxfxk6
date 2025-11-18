@@ -12,10 +12,10 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
-# Example schemas (replace with your own):
-
+# Example schemas (you can keep these for reference or remove later)
 class User(BaseModel):
     """
     Users collection schema
@@ -38,11 +38,21 @@ class Product(BaseModel):
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
-# --------------------------------------------------
+# App-specific schemas for scraped content
+class TableData(BaseModel):
+    headers: List[str]
+    rows: List[List[str]]
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class ScrapePage(BaseModel):
+    """
+    Stores parsed content from a scraped page.
+    Collection name: "scrapepage"
+    """
+    url: str
+    path: Optional[str] = None
+    title: Optional[str] = None
+    tables: List[TableData] = []
+    scraped_at: Optional[datetime] = None
+    extra: Optional[Dict[str, Any]] = None
+
+# Add your own schemas here if needed
